@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <title>MU88</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="icon" href="gb.png">
+    <style>
+       :root {
+        color-scheme: dark;
+      }
+      @font-face {
+  font-family: "Renner";
+  src: url("./Renner.ttf") format("truetype");
+  font-display: swap;
+}
+      body {
+        background:rgb(0, 0, 0);
+       font-family: "Renner", sans-serif;
+        margin: 0;
+        padding:0;
+      }
+h1{
+font-weight:300;
+font-size:25px;
+}
+      header {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      canvas{
+        height: 100%;
+      aspect-ratio: 160 / 144;
+        image-rendering: pixelated;
+        border: 1px solid #000000;
+        background: #000;
+      }
+      .row {
+        padding-top:0px;
+height:83vh;
+justify-content: center; 
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+      .mono {
+       font-size:20px; 
+      }
+      small {
+        opacity: 0.7;
+      }
+      button{
+font-family: "Renner", sans-serif;
+padding:10px;
+background:rgb(0, 0, 0);
+color:rgb(255, 255, 255);
+border:1px solid rgb(255, 255, 255);
+}
+.file-input {
+  display: none; /* 本体は隠す */
+}
+
+.file-label {
+  display: inline-block;
+  padding: 10px 16px;
+  background: #000000;
+  color: white;
+    border:1px solid white;
+  border-radius: 0px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: background 0.2s;
+}
+
+
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>88MU</h1>
+      <label class="file-label">
+  Select
+  <input id="rom" type="file" class="file-input">
+</label>
+      
+      <span style="display:none" id="file-name"></span>
+      <button id="fullscreenBtn">Fullscreen</button>
+     <label class="file-label">
+  BIOS ROM
+  <input id="bios" type="file" class="file-input">
+</label>
+
+<label class="file-label">
+  FONT ROM
+  <input id="font" type="file" class="file-input">
+</label>
+
+      <button id="start">Start</button>
+      <div class="mono" id="status" style="display:none">No ROM</div>
+      <div><span class="mono">CPU PC:</span> <span id="pc" class="mono">0x0000</span></div>
+    </header>
+    <div class="row">
+      <canvas id="screen" width="160" height="144"></canvas>
+    </div>
+
+    <canvas id="rec" width="480" height="432" style="display:none"></canvas>
+
+    <script type="module">
+      class PC88Memory {
+  constructor() {
+    this.bios = new Uint8Array(0x8000);  // 32KB BIOS
+    this.ram  = new Uint8Array(0x8000);  // 32KB RAM
+    this.font = new Uint8Array(0x2000);  // 8KB FONT ROM
+  }
+
+  read(addr) {
+    addr &= 0xffff;
+
+    if (addr < 0x8000) {
+      return this.bios[addr];   // BIOS ROM
+    }
+    return this.ram[addr - 0x8000]; // RAM
+  }
+
+  write(addr, value) {
+    addr &= 0xffff;
+    if (addr < 0x8000) return; // BIOS ROM は書けない
+    this.ram[addr - 0x8000] = value;
+  }
+
+  // FONT ROM は I/O ポート経由で読む
+  ioRead(port) {
+    // PC-88 のフォント読み出しは 0xA0〜0xA3 付近
+    if ((port & 0xff) === 0xA0) {
+      return this.font[this.fontIndex & (this.font.length - 1)];
+    }
+    return 0xff;
+  }
+
+  ioWrite(port, value) {
+    // フォントアドレス設定
+    if ((port & 0xff) === 0xA1) {
+      this.fontIndex = value;
+    }
+  }
+}
+/*
+class Z80 {
+  constructor(memory) {
+    this.mem = memory;
+    this.reset();
+  }
+  reset() {
+    this.pc = 0x0000;
+    this.halt = false;
+  }
+  step() {
+    if (this.halt) return;
+    const op = this.mem[this.pc & 0xffff];
+    // 超簡易: NOP(0x00)だけ対応、他はとりあえず1バイト進める
+    switch (op) {
+      case 0x00: // NOP
+        this.pc = (this.pc + 1) & 0xffff;
+        break;
+      case 0x76: // HALT
+        this.halt = true;
+        this.pc = (this.pc + 1) & 0xffff;
+        break;
+      default:
+        // 実際は命令デコードが必要だが、PoCなので1バイト進めるだけ
+        this.pc = (this.pc + 1) & 0xffff;
+        break;
+    }
+  }
+}
+*/
+class Z80 {
+  constructor(mem) {
+    this.mem = mem;
+    this.reset();
+  }
+
+  reset() {
+    this.pc = 0x0000;
+    this.halt = false;
+  }
+
+  read8(addr) {
+    return this.mem.read(addr);
+  }
+
+  write8(addr, v) {
+    this.mem.write(addr, v);
+  }
+
+  in(port) {
+    return this.mem.ioRead(port);
+  }
+
+  out(port, v) {
+    this.mem.ioWrite(port, v);
+  }
+
+  step() {
+    const op = this.read8(this.pc);
+
+    switch (op) {
+      case 0x00: // NOP
+        this.pc = (this.pc + 1) & 0xffff;
+        break;
+
+      case 0xDB: { // IN A,(n)
+        const port = this.read8(this.pc + 1);
+        const v = this.in(port);
+        // A レジスタ未実装なので捨てる
+        this.pc = (this.pc + 2) & 0xffff;
+        break;
+      }
+
+      case 0xD3: { // OUT (n),A
+        const port = this.read8(this.pc + 1);
+        this.out(port, 0); // A 未実装
+        this.pc = (this.pc + 2) & 0xffff;
+        break;
+      }
+
+      default:
+        this.pc = (this.pc + 1) & 0xffff;
+        break;
+    }
+  }
+}
+
+class PC88 {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.width = canvas.width;
+    this.height = canvas.height;
+
+    // 本来は64KB以上＋VRAMだが、PoCとして単純なメモリ空間
+    this.mem = new Uint8Array(0x10000);
+    this.mem = new PC88Memory();
+    this.cpu = new Z80(this.mem);
+
+    // 仮VRAM: 160x144の1byte/pixel (0 or 1) として扱う
+    this.vram = new Uint8Array(this.width * this.height);
+
+    this.running = false;
+    this.lastTime = 0;
+  }
+
+  loadROM(romBytes) {
+    // とりあえずROMを0x0000から配置（本物のPC-88とは違うがPoC用）
+    this.mem.fill(0);
+    this.mem.set(romBytes.slice(0, this.mem.length), 0);
+    this.cpu.reset();
+  }
+
+  reset() {
+    this.cpu.reset();
+  }
+
+  stepFrame() {
+    // 1フレームあたりのCPUステップ数（適当な値）
+    const STEPS_PER_FRAME = 20000;
+    for (let i = 0; i < STEPS_PER_FRAME; i++) {
+      this.cpu.step();
+      // 本来はI/Oポート経由でVRAMやサウンドを更新する
+      // ここではデモとしてPC値を使ってVRAMを動かす
+      const idx = this.cpu.pc % this.vram.length;
+      this.vram[idx] = (this.vram[idx] + 1) & 1;
+    }
+    this.render();
+  }
+
+  render() {
+    const imageData = this.ctx.createImageData(this.width, this.height);
+    const data = imageData.data;
+    for (let i = 0; i < this.vram.length; i++) {
+      const v = this.vram[i] ? 255 : 0;
+      const o = i * 4;
+      data[o] = v;
+      data[o + 1] = v;
+      data[o + 2] = v;
+      data[o + 3] = 255;
+    }
+    this.ctx.putImageData(imageData, 0, 0);
+  }
+
+  start() {
+    if (this.running) return;
+    this.running = true;
+    const loop = (t) => {
+      if (!this.running) return;
+      this.stepFrame();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+
+  stop() {
+    this.running = false;
+  }
+}
+
+// ---- DOMとの接続 ----
+const canvas = document.getElementById("screen");
+const statusEl = document.getElementById("status");
+const pcEl = document.getElementById("pc");
+const fileInput = document.getElementById("rom");
+const fileNameEl = document.getElementById("file-name");
+const startBtn = document.getElementById("start");
+const fullscreenBtn = document.getElementById("fullscreenBtn");
+
+const emu = new PC88(canvas);
+
+let romLoaded = false;
+const mem = new PC88Memory();
+const cpu = new Z80(mem);
+
+document.getElementById("bios").addEventListener("change", async (e) => {
+  const buf = await e.target.files[0].arrayBuffer();
+  const rom = new Uint8Array(buf);
+  mem.bios.set(rom.slice(0, 0x8000));
+  console.log("BIOS loaded");
+});
+
+document.getElementById("font").addEventListener("change", async (e) => {
+  const buf = await e.target.files[0].arrayBuffer();
+  const rom = new Uint8Array(buf);
+  mem.font.set(rom.slice(0, mem.font.length));
+  console.log("FONT loaded");
+});
+
+fileInput.addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  fileNameEl.style.display = "inline";
+  fileNameEl.textContent = file.name;
+
+  const buf = await file.arrayBuffer();
+  const romBytes = new Uint8Array(buf);
+  emu.loadROM(romBytes);
+  romLoaded = true;
+  statusEl.style.display = "inline";
+  statusEl.textContent = "ROM loaded";
+});
+
+startBtn.addEventListener("click", () => {
+  if (!romLoaded) {
+    statusEl.style.display = "inline";
+    statusEl.textContent = "No ROM";
+    return;
+  }
+  emu.start();
+});
+
+fullscreenBtn.addEventListener("click", () => {
+  if (!document.fullscreenElement) {
+    canvas.requestFullscreen().catch(console.error);
+  } else {
+    document.exitFullscreen().catch(console.error);
+  }
+});
+
+// PCレジスタ表示（デモ）
+setInterval(() => {
+  pcEl.textContent = "0x" + emu.cpu.pc.toString(16).padStart(4, "0");
+}, 100);
+</script>
+
+  </body>
+</html>
